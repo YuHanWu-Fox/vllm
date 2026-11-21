@@ -386,6 +386,20 @@ class MambaHybridModelState(DefaultModelState):
                 )
                 for group_id, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = full_indices[group_id]
+        elif (
+            self._align_mode
+            and ubatch_inputs is not None
+            and not ubatch_inputs.working_state_indices
+        ):
+            # Padding-only eager microbatches have their own null block rows.
+            # Supply those slots explicitly for each group with the same spec.
+            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+            ubatch_inputs = MambaUBatchAttnInputs(
+                {
+                    group_id: block_tables[group_id][:num_reqs, :1]
+                    for group_id in mamba_group_ids
+                }
+            )
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,

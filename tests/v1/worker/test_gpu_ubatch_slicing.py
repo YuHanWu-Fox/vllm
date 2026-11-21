@@ -678,7 +678,9 @@ def test_hybrid_ubatches_continue_state(
             hidden_states = self[0](inputs_embeds)
             # Stand in for a MoE handoff between recurrent layers.
             dbo_yield()
-            return self[1](hidden_states)
+            for layer in list(self)[1:]:
+                hidden_states = layer(hidden_states)
+            return hidden_states
 
     with set_current_vllm_config(config), set_default_torch_dtype(dtype), device:
         gdn = QwenGatedDeltaNetAttention(hf_config, config, prefix="layers.0.gdn")
@@ -695,12 +697,18 @@ def test_hybrid_ubatches_continue_state(
             cache_config=config.cache_config,
             prefix="layers.1.mamba",
         )
-        model = RecurrentLayers(gdn, mamba)
+        layers = [gdn, mamba]
+        if cache_mode == "align" and batch_case == "empty_prefill":
+            # A second GDN cache group uses the same spec and builder type.
+            layers.append(
+                QwenGatedDeltaNetAttention(hf_config, config, prefix="layers.2.gdn")
+            )
+        model = RecurrentLayers(*layers)
         for param in model.parameters():
             param.uniform_(-0.25, 0.25)
         mamba.A.fill_(-0.5)
 
-    num_blocks = 4 * max_num_reqs + 1
+    num_blocks = 2 * len(model) * max_num_reqs + 1
     groups = []
     for group_id, layer in enumerate(model):
         spec = layer.get_kv_cache_spec(config)
@@ -724,7 +732,7 @@ def test_hybrid_ubatches_continue_state(
         [group.kv_cache_spec.block_size for group in groups],
         max_num_reqs=max_num_reqs,
         max_num_batched_tokens=64,
-        max_num_blocks_per_group=[3, 3] if cache_mode == "align" else [1, 1],
+        max_num_blocks_per_group=[3 if cache_mode == "align" else 1] * len(groups),
         device=device,
     )
     if batch_case == "mixed":
@@ -875,17 +883,18 @@ def test_hybrid_ubatches_continue_state(
                     assert (slots == PAD_SLOT_ID).all()
                 metadata = padding_context.attn_metadata
                 assert isinstance(metadata, dict)
-                gdn_metadata = metadata[gdn.prefix]
+                for layer in model:
+                    if isinstance(layer, QwenGatedDeltaNetAttention):
+                        gdn_metadata = metadata[layer.prefix]
+                        assert isinstance(gdn_metadata, GDNAttentionMetadata)
+                        assert gdn_metadata.num_decode_tokens == 1
+                        indices = gdn_metadata.non_spec_state_indices_tensor
+                        assert indices is not None
+                        assert (indices == NULL_BLOCK_ID).all()
                 mamba_metadata = metadata[mamba.prefix]
-                assert isinstance(gdn_metadata, GDNAttentionMetadata)
                 assert isinstance(mamba_metadata, Mamba2AttentionMetadata)
-                assert gdn_metadata.num_decode_tokens == 1
                 assert mamba_metadata.num_decode_tokens == 1
-                assert gdn_metadata.non_spec_state_indices_tensor is not None
                 assert mamba_metadata.state_indices_tensor_d is not None
-                assert (
-                    gdn_metadata.non_spec_state_indices_tensor == NULL_BLOCK_ID
-                ).all()
                 assert (mamba_metadata.state_indices_tensor_d == NULL_BLOCK_ID).all()
                 for cache, saved in zip(caches, initial):
                     torch.testing.assert_close(
