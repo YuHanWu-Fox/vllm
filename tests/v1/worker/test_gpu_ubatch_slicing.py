@@ -355,6 +355,57 @@ def test_all_padding_microbatch_has_no_work_to_do():
     ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+@pytest.mark.parametrize("cg_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
+def test_attention_only_padding_microbatch_preserves_collective_size(cg_mode, tmp_path):
+    """Padding-only eager attention is skipped, while FULL keeps its metadata."""
+    from transformers import MixtralConfig
+
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+    MixtralConfig(architectures=["MixtralForCausalLM"]).save_pretrained(tmp_path)
+    config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path), dtype="float16"),
+        parallel_config=ParallelConfig(
+            enable_dbo=True,
+            data_parallel_size=2,
+            all2all_backend="deepep_low_latency",
+        ),
+    )
+    device = torch.device("cuda:0")
+    num_reqs_padded = 16 if cg_mode == CUDAGraphMode.FULL else 6
+    batch = _make_input_batch(
+        [1] * 6,
+        [64] * 6,
+        InputBuffers(16, 16, device),
+        num_reqs_padded=num_reqs_padded,
+        num_tokens_padded=16,
+    )
+    batch.is_padding[:6].fill_(False)
+    batch.is_padding[6:].fill_(True)
+    model_state = DefaultModelState(config, torch.nn.Identity(), None, device)
+    cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    runner = UBatchRunner(config, device, model_state, [], cache_config, 16)
+    state = runner.prepare(
+        batch,
+        (),
+        torch.empty((0, 16), dtype=torch.int64, device=device),
+        BatchExecutionDescriptor(
+            cg_mode=cg_mode,
+            num_tokens=16,
+            num_reqs=num_reqs_padded,
+            uniform_token_count=1,
+            num_ubatches=2,
+        ),
+    )
+    first, padding = state.forward_contexts
+    assert first.attn_metadata is not None
+    assert (padding.attn_metadata is None) == (cg_mode == CUDAGraphMode.NONE)
+    assert padding.is_padding is not None and padding.is_padding.all()
+    assert padding.dp_metadata is not None
+    assert padding.dp_metadata.num_tokens_across_dp_cpu.tolist() == [8, 8]
+
+
 def test_microbatching_off_when_a_rank_does_not_allow_it():
     # A remote rank can veto the split while the local rank is eligible.
     assert _sync_dp([256, 256], allow_ubatching=[True, False])[0].num_ubatches == 1

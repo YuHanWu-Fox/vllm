@@ -80,9 +80,10 @@ The batch is sliced before its attention metadata is built. `prepare` splits the
 batch at the midpoint of the DP-padded token count. A uniform batch of multi-token
 queries (speculative decoding verification) is split on a request boundary
 instead, so that each microbatch stays a uniform decode. An eager microbatch
-with only padding uses a one-token dummy decode for attention metadata. Its
-block tables contain null blocks, and its slot mapping disables KV writes.
-The model still uses the whole padded token slice for expert collectives.
+with only padding skips attention metadata for models with no per-microbatch
+model-state inputs. Hybrid models use a one-token dummy decode with null block
+tables and a slot mapping that disables KV writes. Both paths use the whole
+padded token slice for expert collectives.
 Full CUDA graph replay keeps the captured request boundary and updates the
 per-microbatch metadata in place. Padding rows use null recurrent-state indices.
 

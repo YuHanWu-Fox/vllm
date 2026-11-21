@@ -442,14 +442,19 @@ class UBatchRunner:
             input_batch, ubatch_slices
         )
 
-        attn_metadata = []
-        slot_mappings_by_layer = []
-        is_padding = []
+        attn_metadata: list[dict[str, Any] | None] = []
+        slot_mappings_by_layer: list[dict[str, torch.Tensor] | None] = []
+        is_padding: list[torch.Tensor | None] = []
         for i, ubatch_slice in enumerate(ubatch_slices):
             token_slice = ubatch_slice.token_slice
             is_padding.append(input_batch.is_padding[token_slice])
             ubatch_slot_mappings = slot_mappings[:, token_slice]
             if cg_mode == CUDAGraphMode.NONE and ubatch_slice.is_empty():
+                if ubatch_attn_inputs is None:
+                    # Padding still participates in expert collectives.
+                    attn_metadata.append(None)
+                    slot_mappings_by_layer.append(None)
+                    continue
                 # The real slot mapping is already all PAD_SLOT_ID. The
                 # dummy row has no state of its own and no access to A's table.
                 ubatch, ubatch_block_tables = self._get_padding_attn_inputs(
@@ -501,8 +506,8 @@ class UBatchRunner:
     def _make_forward_contexts(
         self,
         ubatch_slices: UBatchSlices,
-        attn_metadata: list[dict[str, Any]],
-        slot_mappings_by_layer: list[dict[str, torch.Tensor]],
+        attn_metadata: list[dict[str, Any] | None],
+        slot_mappings_by_layer: list[dict[str, torch.Tensor] | None],
         is_padding: list[torch.Tensor | None],
     ) -> list[ForwardContext]:
         """Build one forward context per microbatch.
